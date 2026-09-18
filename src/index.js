@@ -1,11 +1,16 @@
 import { hasBaseline, importBaseline, initTables } from './db';
+import { initSettings } from './settings';
+import { startSchedule } from './schedule';
 import { setCtx } from './runtime';
+import { MOD_VERSION } from './version';
 import MutualsView from './MutualsView.vue';
+
+export { MOD_VERSION };
 
 export default {
     id: 'mutualstracker',
     name: 'Mutuals Tracker',
-    version: '0.1.0',
+    version: MOD_VERSION,
 
     async setup(ctx) {
         setCtx(ctx);
@@ -13,6 +18,8 @@ export default {
         ctx.onLogin(async () => {
             try {
                 await initTables(ctx);
+                await initSettings(ctx);
+
                 // Beim ersten Start VRCXs vorhandenen Mutual-Graph als
                 // Ausgangszustand uebernehmen - sonst waere der erste Scan ein
                 // Meer aus falschen "neu dazugekommen"-Meldungen.
@@ -20,6 +27,8 @@ export default {
                     const n = await importBaseline(ctx);
                     ctx.log(`Ausgangszustand uebernommen: ${n} Verbindungen`);
                 }
+
+                startSchedule(ctx);
             } catch (err) {
                 ctx.error('Initialisierung fehlgeschlagen:', err);
             }

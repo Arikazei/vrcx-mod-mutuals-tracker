@@ -13,7 +13,31 @@
                 </button>
             </div>
             <input v-model="search" class="mt-search" type="text" placeholder="Suche…" />
+            <button class="mt-btn" :class="{ 'mt-btn--on': showPicker }" @click="showPicker = !showPicker">
+                Personen ({{ visibleCountLabel }})
+            </button>
             <span class="mt-muted">{{ statusLine }}</span>
+            <span class="mt-hint">v{{ MOD_VERSION }}</span>
+        </div>
+
+        <!-- Personenauswahl: reiner Anzeigefilter, gescannt wird weiterhin alles -->
+        <div v-if="showPicker" class="mt-picker">
+            <div class="mt-picker-head">
+                <input v-model="pickerSearch" class="mt-search" type="text" placeholder="Person suchen…" />
+                <button class="mt-btn" @click="selectAll">Alle</button>
+                <button class="mt-btn" @click="selectNone">Keine</button>
+                <span class="mt-muted">
+                    {{ settings.visible === null ? 'alle sichtbar' : settings.visible.length + ' ausgewählt' }}
+                </span>
+                <button class="mt-btn mt-btn--on" @click="applyPicker">Übernehmen</button>
+            </div>
+            <div class="mt-picker-list">
+                <label v-for="p in pickerPeople" :key="p.userId" class="mt-picker-item">
+                    <input type="checkbox" :checked="isPicked(p.userId)" @change="togglePick(p.userId)" />
+                    <span>{{ p.name }}</span>
+                </label>
+                <span v-if="!pickerPeople.length" class="mt-muted">Keine Treffer.</span>
+            </div>
         </div>
 
         <!-- Scan-Leiste -->
@@ -29,6 +53,19 @@
                 <template v-if="lastRun.baseline"> (Ausgangszustand)</template>
                 <template v-else> · {{ lastRun.scanned }} Freunde geprüft</template>
             </span>
+            <label class="mt-muted mt-auto">
+                <input type="checkbox" :checked="settings.autoScan.enabled" @change="toggleAuto" />
+                automatisch alle
+                <input
+                    class="mt-num"
+                    type="number"
+                    min="1"
+                    max="48"
+                    :value="settings.autoScan.hours"
+                    @change="setAutoHours($event)" />
+                Stunden
+            </label>
+            <span v-if="scanSource === 'auto'" class="mt-muted">(läuft gerade automatisch)</span>
             <span class="mt-hint">
                 Ein Scan fragt jeden Freund einzeln ab (1 Anfrage / 1,5 s) — bei {{ friendCount }} Freunden also
                 rund {{ Math.ceil((friendCount * 1.5) / 60) }} Minuten.
@@ -143,8 +180,10 @@
 
     import { buildOwnTimeline, friendshipSpans, groupPurges, purgeContext } from './engine';
     import { loadEdges, loadEvents, loadOwnHistory, loadRuns } from './db';
+    import { DEFAULT_SETTINGS, loadSettings, saveSettings } from './settings';
     import { runScan } from './scanner';
-    import { getCtx } from './runtime';
+    import { getCtx, scanState } from './runtime';
+    import { MOD_VERSION } from './version';
     import { t } from './i18n';
 
     const TABS = [
@@ -161,9 +200,16 @@
     const edges = ref([]);
     const runs = ref([]);
     const names = ref(new Map());
-    const scanning = ref(false);
-    const stopFlag = ref(false);
-    const progress = ref({ done: 0, total: 0, changes: 0, optedOut: 0 });
+    const settings = ref(structuredClone(DEFAULT_SETTINGS));
+    const showPicker = ref(false);
+    const pickerSearch = ref('');
+    const pickerDraft = ref(null); // null = alle
+
+    // Scan-Zustand liegt im Modul, nicht in der View: so sieht man auch einen
+    // Lauf, der im Hintergrund vom Zeitplan gestartet wurde.
+    const scanning = computed(() => scanState.running);
+    const scanSource = computed(() => scanState.source);
+    const progress = computed(() => scanState.progress);
 
     const lastRun = computed(() => runs.value[0] || null);
     const friendCount = computed(() => getCtx().stores.friends?.friends?.size ?? 0);
@@ -243,11 +289,92 @@
         return parts.some((p) => String(p || '').toLowerCase().includes(q));
     }
 
-    const visibleOwn = computed(() => ownTimeline.value.filter((r) => matches(r.displayName, r.userId)));
-    const visibleEvents = computed(() =>
-        events.value.filter((r) => matches(nameOf(r.friendId), nameOf(r.mutualId), r.friendId, r.mutualId))
+    /** null = kein Filter. Sonst Menge der sichtbaren userIds. */
+    const visibleSet = computed(() => (settings.value.visible === null ? null : new Set(settings.value.visible)));
+
+    function shown(...ids) {
+        const set = visibleSet.value;
+        if (!set) return true;
+        return ids.some((id) => id && set.has(id));
+    }
+
+    const visibleCountLabel = computed(() =>
+        settings.value.visible === null ? 'alle' : String(settings.value.visible.length)
     );
-    const visiblePurges = computed(() => purges.value.filter((g) => matches(nameOf(g.mutualId), g.mutualId)));
+
+    const visibleOwn = computed(() =>
+        ownTimeline.value.filter((r) => shown(r.userId) && matches(r.displayName, r.userId))
+    );
+    const visibleEvents = computed(() =>
+        events.value.filter(
+            (r) => shown(r.friendId, r.mutualId) && matches(nameOf(r.friendId), nameOf(r.mutualId), r.friendId, r.mutualId)
+        )
+    );
+    const visiblePurges = computed(() =>
+        purges.value.filter((g) => shown(g.mutualId, ...g.friendIds) && matches(nameOf(g.mutualId), g.mutualId))
+    );
+
+    // ----------------------------------------------------------- Personenwahl
+    /** Alle Personen, die irgendwo vorkommen - Freunde plus Namen aus der Historie. */
+    const allPeople = computed(() => {
+        const map = new Map();
+        for (const [id, name] of names.value) map.set(id, name);
+        for (const row of ownTimeline.value) if (!map.has(row.userId)) map.set(row.userId, row.displayName || row.userId);
+        return [...map.entries()]
+            .map(([userId, name]) => ({ userId, name }))
+            .sort((a, b) => a.name.localeCompare(b.name));
+    });
+
+    const pickerPeople = computed(() => {
+        const q = pickerSearch.value.trim().toLowerCase();
+        const list = q ? allPeople.value.filter((p) => p.name.toLowerCase().includes(q)) : allPeople.value;
+        return list.slice(0, 400);
+    });
+
+    function isPicked(userId) {
+        return pickerDraft.value === null || pickerDraft.value.has(userId);
+    }
+
+    function togglePick(userId) {
+        // Aus "alle" wird beim ersten Abwaehlen eine echte Auswahl
+        if (pickerDraft.value === null) pickerDraft.value = new Set(allPeople.value.map((p) => p.userId));
+        if (pickerDraft.value.has(userId)) pickerDraft.value.delete(userId);
+        else pickerDraft.value.add(userId);
+        pickerDraft.value = new Set(pickerDraft.value);
+    }
+
+    function selectAll() {
+        pickerDraft.value = null;
+    }
+
+    function selectNone() {
+        pickerDraft.value = new Set();
+    }
+
+    async function applyPicker() {
+        settings.value.visible = pickerDraft.value === null ? null : [...pickerDraft.value];
+        showPicker.value = false;
+        await persist();
+    }
+
+    async function persist() {
+        try {
+            await saveSettings(getCtx(), JSON.parse(JSON.stringify(settings.value)));
+        } catch (err) {
+            getCtx().error('Einstellungen nicht gespeichert:', err);
+        }
+    }
+
+    async function toggleAuto(event) {
+        settings.value.autoScan.enabled = event.target.checked;
+        await persist();
+    }
+
+    async function setAutoHours(event) {
+        const n = Number(event.target.value);
+        settings.value.autoScan.hours = Math.min(48, Math.max(1, Number.isFinite(n) ? n : 6));
+        await persist();
+    }
 
     async function refresh() {
         const ctx = getCtx();
@@ -257,6 +384,8 @@
             events.value = await loadEvents(ctx);
             edges.value = await loadEdges(ctx);
             runs.value = await loadRuns(ctx);
+            settings.value = await loadSettings(ctx);
+            pickerDraft.value = settings.value.visible === null ? null : new Set(settings.value.visible);
             ctxCache.clear();
             buildNames();
         } catch (err) {
@@ -266,24 +395,28 @@
 
     async function startScan() {
         const ctx = getCtx();
-        scanning.value = true;
-        stopFlag.value = false;
-        progress.value = { done: 0, total: friendCount.value, changes: 0, optedOut: 0 };
+        if (scanState.running) return; // laeuft schon - z.B. automatisch im Hintergrund
+
+        scanState.running = true;
+        scanState.source = 'manual';
+        scanState.stopRequested = false;
+        scanState.progress = { done: 0, total: friendCount.value, changes: 0, optedOut: 0 };
         try {
             await runScan(ctx, {
-                onProgress: (p) => (progress.value = p),
-                shouldStop: () => stopFlag.value
+                onProgress: (p) => (scanState.progress = p),
+                shouldStop: () => scanState.stopRequested
             });
         } catch (err) {
             ctx.error('Scan abgebrochen:', err);
         } finally {
-            scanning.value = false;
+            scanState.running = false;
+            scanState.source = null;
             await refresh();
         }
     }
 
     function stopScan() {
-        stopFlag.value = true;
+        scanState.stopRequested = true;
     }
 
     onMounted(refresh);
@@ -450,5 +583,47 @@
         opacity: 0.6;
         padding: 24px;
         font-size: 13px;
+    }
+    .mt-picker {
+        border: 1px solid var(--border, #4443);
+        border-radius: 8px;
+        padding: 10px;
+        margin-bottom: 10px;
+    }
+    .mt-picker-head {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        flex-wrap: wrap;
+        margin-bottom: 8px;
+    }
+    .mt-picker-list {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+        gap: 2px 12px;
+        max-height: 220px;
+        overflow: auto;
+    }
+    .mt-picker-item {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        padding: 2px 0;
+        cursor: pointer;
+    }
+    .mt-num {
+        width: 48px;
+        padding: 2px 4px;
+        border: 1px solid var(--border, #4443);
+        border-radius: 4px;
+        background: transparent;
+        color: inherit;
+        font-size: 12px;
+    }
+    .mt-auto {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
     }
 </style>
