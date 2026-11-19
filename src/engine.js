@@ -140,3 +140,162 @@ export function friendshipSpans(timeline) {
     }
     return [...byUser.values()];
 }
+
+// ---------------------------------------------------------------------------
+// Plausibilitaet (ab 0.3.0)
+//
+// Wichtig: VRChats "mutuals"-Liste eines Freundes F enthaelt nur Leute, die
+// mit F UND mit MIR befreundet sind. Endet MEINE Freundschaft mit X, faellt X
+// automatisch aus allen Listen - das ist kein Entfernen zwischen F und X.
+// Genauso taucht ein neuer Freund von mir ploetzlich bei allen gemeinsamen
+// Freunden auf. Beides darf nicht als Veraenderung gemeldet werden.
+// ---------------------------------------------------------------------------
+
+/**
+ * Teilt einen Diff in echte und scheinbare Veraenderungen.
+ *
+ * @param {object} p
+ * @param {string[]} p.known        aktive Kanten des Freundes
+ * @param {string[]} p.current      frisch abgerufene Mutuals
+ * @param {Set<string>} p.myFriends meine aktuellen Freunde
+ * @param {Set<string>} p.newFriends seit dem letzten Lauf neu befreundet
+ * @param {Set<string>} [p.hidden]  Kanten, die nur wegen meiner Freundschaft verschwanden
+ * @param {boolean} [p.friendIsNew] der Freund selbst ist neu - seine ganze Liste ist Ausgangszustand
+ */
+export function classifyChanges({ known, current, myFriends, newFriends, hidden = new Set(), friendIsNew = false }) {
+    const { added: rawAdded, removed: rawRemoved } = diffMutuals(known, current);
+    const added = [];
+    const silentAdded = [];
+    const removed = [];
+    const hide = [];
+
+    for (const id of rawAdded) {
+        if (friendIsNew || newFriends.has(id) || hidden.has(id)) silentAdded.push(id);
+        else added.push(id);
+    }
+    for (const id of rawRemoved) {
+        if (!myFriends.has(id)) hide.push(id);
+        else removed.push(id);
+    }
+    return { added, silentAdded, removed, hidden: hide };
+}
+
+/** Faellt bei EINEM Freund auf einmal ein grosser Teil weg, ist eher die Abfrage unvollstaendig. */
+export function isMassDrop(removedCount, knownCount, minCount = 5, minShare = 0.3) {
+    if (removedCount < minCount || knownCount <= 0) return false;
+    return removedCount / knownCount >= minShare;
+}
+
+/** friend_log_history -> Map userId -> [{at, type}] aufsteigend sortiert. */
+export function buildHistoryIndex(rows) {
+    const map = new Map();
+    for (const r of rows) {
+        if (r.type !== 'Friend' && r.type !== 'Unfriend') continue;
+        if (!map.has(r.userId)) map.set(r.userId, []);
+        map.get(r.userId).push({ at: r.createdAt, type: r.type });
+    }
+    for (const list of map.values()) list.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+    return map;
+}
+
+/** War userId zum Zeitpunkt iso mit mir befreundet? */
+export function wasFriendAt(history, userId, iso, currentFriends) {
+    const list = history.get(userId) || [];
+    let state = null;
+    for (const e of list) {
+        if (e.at <= iso) state = e.type === 'Friend';
+        else break;
+    }
+    if (state !== null) return state;
+    const later = list.find((e) => e.at > iso);
+    if (later) return later.type === 'Unfriend';
+    return currentFriends.has(userId);
+}
+
+// VRCX notiert ein Unfriend erst, wenn es die Freundesliste neu abgleicht -
+// das kann spaeter sein als der Scan, der den Abgang schon sieht.
+export const UNFRIEND_LAG_HOURS = 24;
+const ADD_LAG_HOURS = 2;
+
+export function shiftIso(iso, hours) {
+    return new Date(new Date(iso).getTime() + hours * 3600 * 1000).toISOString();
+}
+
+/** Hat mich userId kurz nach iso entfreundet (bzw. ich ihn)? */
+export function unfriendedSoonAfter(history, userId, iso, hours = UNFRIEND_LAG_HOURS) {
+    const until = shiftIso(iso, hours);
+    return (history.get(userId) || []).some((e) => e.type === 'Unfriend' && e.at > iso && e.at <= until);
+}
+
+/** Wurde userId im Zeitraum (from, to] mein Freund? */
+export function becameFriendBetween(history, userId, from, to) {
+    const list = history.get(userId) || [];
+    return list.some((e) => e.type === 'Friend' && (!from || e.at > from) && e.at <= to);
+}
+
+/**
+ * Findet bereits gespeicherte Fehleintraege (Altdaten vor 0.3.0).
+ *
+ * @param {Array<{id, friendId, mutualId, type, detectedAt, runId}>} events
+ * @param {Map} history            aus buildHistoryIndex
+ * @param {Set<string>} currentFriends
+ * @param {Map<number, string>} prevStartByRun runId -> started_at des Laufs davor
+ * @returns {{removed: Array, added: Array}} zu verwerfende Events
+ */
+export function findFalseEvents(events, history, currentFriends, prevStartByRun) {
+    const removed = [];
+    const added = [];
+    for (const e of events) {
+        if (e.type === 'removed') {
+            if (
+                !wasFriendAt(history, e.mutualId, e.detectedAt, currentFriends) ||
+                unfriendedSoonAfter(history, e.mutualId, e.detectedAt)
+            ) {
+                removed.push(e);
+            }
+        } else if (e.type === 'added') {
+            const from = prevStartByRun.get(e.runId) || null;
+            const to = shiftIso(e.detectedAt, ADD_LAG_HOURS);
+            if (
+                becameFriendBetween(history, e.mutualId, from, to) ||
+                becameFriendBetween(history, e.friendId, from, to)
+            ) {
+                added.push(e);
+            }
+        }
+    }
+    return { removed, added };
+}
+
+/**
+ * Plant die Abfragen fuer eine Nachpruefung. Ob A und B befreundet sind, sieht
+ * man in der Mutual-Liste von A - aber nur, wenn B mein Freund ist (und
+ * umgekehrt). Wer in vielen Paaren vorkommt, wird bevorzugt abgefragt.
+ *
+ * @returns {{plan: Map<string, Array<{pair, other}>>, unknown: Array}}
+ */
+export function planVerification(pairs, myFriends) {
+    const count = new Map();
+    for (const p of pairs) {
+        count.set(p.friendId, (count.get(p.friendId) || 0) + 1);
+        count.set(p.mutualId, (count.get(p.mutualId) || 0) + 1);
+    }
+    const plan = new Map();
+    const unknown = [];
+    for (const pair of pairs) {
+        const a = pair.friendId;
+        const b = pair.mutualId;
+        const options = [];
+        if (myFriends.has(b)) options.push({ target: a, other: b });
+        if (myFriends.has(a)) options.push({ target: b, other: a });
+        if (!options.length) {
+            unknown.push(pair);
+            continue;
+        }
+        options.sort((x, y) => (count.get(y.target) || 0) - (count.get(x.target) || 0));
+        const { target, other } = options[0];
+        if (!plan.has(target)) plan.set(target, []);
+        plan.get(target).push({ pair, other });
+    }
+    return { plan, unknown };
+}

@@ -47,6 +47,8 @@
             <span v-if="scanning" class="mt-muted">
                 {{ progress.done }}/{{ progress.total }} · {{ progress.changes }} Änderungen ·
                 {{ progress.optedOut }} nicht einsehbar
+                <template v-if="progress.rejected"> · {{ progress.rejected }} Fehlmeldungen verworfen</template>
+                <template v-if="progress.held"> · {{ progress.held }} zurückgestellt</template>
             </span>
             <span v-else-if="lastRun" class="mt-muted">
                 zuletzt: {{ formatDate(lastRun.finishedAt || lastRun.startedAt) }}
@@ -66,6 +68,8 @@
                 Stunden
             </label>
             <span v-if="scanSource === 'auto'" class="mt-muted">(läuft gerade automatisch)</span>
+            <span v-else-if="scanSource === 'departures'" class="mt-muted">(prüft gerade Ex-Freunde)</span>
+            <span v-else-if="scanSource === 'verify'" class="mt-muted">(Nachprüfung läuft)</span>
             <span class="mt-hint">
                 Ein Scan fragt jeden Freund einzeln ab (1 Anfrage / 1,5 s) — bei {{ friendCount }} Freunden also
                 rund {{ Math.ceil((friendCount * 1.5) / 60) }} Minuten.
@@ -130,6 +134,8 @@
                             <span class="mt-badge" :class="row.type === 'removed' ? 'mt-badge--out' : 'mt-badge--in'">
                                 {{ row.type === 'removed' ? 'raus' : 'dazu' }}
                             </span>
+                            <span v-if="row.verifiedAt" class="mt-muted" title="nachgeprüft"> ✓</span>
+                            <span v-if="row.source === 'departure'" class="mt-muted"> (Ex-Freund)</span>
                         </td>
                         <td>{{ formatDate(row.detectedAt) }}</td>
                     </tr>
@@ -139,17 +145,74 @@
 
         <!-- Tab: Aufraeumaktionen -->
         <div v-else class="mt-scroll">
-            <p v-if="!purges.length" class="mt-empty">
-                Keine Aufräumaktionen erkannt. Dafür müssen mindestens zwei deiner Freunde dieselbe Person im selben
-                Zeitraum verloren haben.
+            <div class="mt-section-head">
+                <h3 class="mt-h3">Beendete Freundschaften</h3>
+                <span class="mt-muted">
+                    Nach dem Ende wird die Mutual-Liste der Person einmal neu abgefragt: wer fehlt, ist dort wirklich
+                    raus.
+                </span>
+            </div>
+            <p v-if="!visibleDepartures.length" class="mt-empty">
+                Noch keine geprüft. Das passiert automatisch nach jedem Scan (und kurz nach dem Start).
             </p>
-            <div v-for="(g, i) in visiblePurges" :key="i" class="mt-card">
+            <div v-for="d in visibleDepartures" :key="d.userId" class="mt-card">
+                <div class="mt-card-head">
+                    <a class="mt-link mt-strong" @click="openUser(d.userId)">{{ nameOf(d.userId) }}</a>
+                    <span v-if="d.removedIds.length >= 2" class="mt-badge mt-badge--out">Aufräumaktion</span>
+                    <span class="mt-muted">
+                        Freundschaft beendet {{ d.endedAt ? formatDate(d.endedAt) : 'unbekannt' }} · geprüft
+                        {{ formatDate(d.checkedAt) }}
+                    </span>
+                    <button class="mt-btn mt-btn--small" :disabled="scanning" @click="recheckDeparture(d.userId)">
+                        Neu prüfen
+                    </button>
+                </div>
+                <div class="mt-card-body">
+                    <div v-if="d.status === 'hidden'" class="mt-muted">Mutuals dieser Person sind nicht einsehbar.</div>
+                    <div v-else-if="d.status === 'failed'" class="mt-muted">
+                        Abfrage fehlgeschlagen - wird beim nächsten Scan wiederholt.
+                    </div>
+                    <template v-else>
+                        <div>
+                            <span class="mt-muted">Nicht mehr befreundet mit ({{ d.removedIds.length }}):</span>
+                            <a v-for="id in d.removedIds" :key="id" class="mt-chip" @click="openUser(id)">
+                                {{ nameOf(id) }}
+                            </a>
+                            <span v-if="!d.removedIds.length" class="mt-muted"> niemand</span>
+                        </div>
+                        <div>
+                            <span class="mt-muted">Noch befreundet mit ({{ d.keptIds.length }}):</span>
+                            <a
+                                v-for="id in d.keptIds.slice(0, 24)"
+                                :key="id"
+                                class="mt-chip mt-chip--soft"
+                                @click="openUser(id)">
+                                {{ nameOf(id) }}
+                            </a>
+                            <span v-if="d.keptIds.length > 24" class="mt-muted">+{{ d.keptIds.length - 24 }}</span>
+                        </div>
+                    </template>
+                </div>
+            </div>
+
+            <div class="mt-section-head">
+                <h3 class="mt-h3">Bei mehreren deiner Freunde raus</h3>
+                <span class="mt-muted">Person ist weiterhin dein Freund, fehlt aber bei mindestens zwei anderen.</span>
+                <button class="mt-btn mt-btn--small" :disabled="scanning || !visiblePurges.length" @click="verifyAll">
+                    Alle prüfen
+                </button>
+                <span v-if="verifyMsg" class="mt-muted">{{ verifyMsg }}</span>
+            </div>
+            <p v-if="!visiblePurges.length" class="mt-empty">Keine erkannt.</p>
+            <div v-for="g in visiblePurges" :key="g.mutualId + g.to" class="mt-card">
                 <div class="mt-card-head">
                     <a class="mt-link mt-strong" @click="openUser(g.mutualId)">{{ nameOf(g.mutualId) }}</a>
                     <span class="mt-muted">
-                        hat sich bei {{ g.friendIds.length }} deiner Freunde entfernt ·
-                        {{ formatDate(g.from) }}<template v-if="g.to !== g.from"> bis {{ formatDate(g.to) }}</template>
+                        bei {{ g.friendIds.length }} deiner Freunde raus · {{ formatDate(g.from) }}
+                        <template v-if="g.to !== g.from"> bis {{ formatDate(g.to) }}</template>
                     </span>
+                    <span v-if="groupVerified(g)" class="mt-badge mt-badge--in">geprüft</span>
+                    <button class="mt-btn mt-btn--small" :disabled="scanning" @click="verifyGroup(g)">Prüfen</button>
                 </div>
                 <div class="mt-card-body">
                     <div>
@@ -179,7 +242,8 @@
     import { computed, onActivated, onMounted, ref } from 'vue';
 
     import { buildOwnTimeline, friendshipSpans, groupPurges, purgeContext } from './engine';
-    import { loadEdges, loadEvents, loadOwnHistory, loadRuns } from './db';
+    import { loadDepartures, loadEdges, loadEvents, loadOwnHistory, loadRuns } from './db';
+    import { checkDepartures, verifyRemovals } from './integrity';
     import { DEFAULT_SETTINGS, loadSettings, saveSettings } from './settings';
     import { runScan } from './scanner';
     import { getCtx, scanState } from './runtime';
@@ -199,6 +263,7 @@
     const events = ref([]);
     const edges = ref([]);
     const runs = ref([]);
+    const departures = ref([]);
     const names = ref(new Map());
     const settings = ref(structuredClone(DEFAULT_SETTINGS));
     const showPicker = ref(false);
@@ -217,7 +282,7 @@
     const statusLine = computed(() => {
         if (view.value === 'own') return `${visibleOwn.value.length} Ereignisse`;
         if (view.value === 'changes') return `${visibleEvents.value.length} Veränderungen`;
-        return `${visiblePurges.value.length} Aktionen`;
+        return `${visibleDepartures.value.length} beendet · ${visiblePurges.value.length} Gruppen`;
     });
 
     /** Namen aus der Freundesliste und aus der eigenen Historie. */
@@ -275,7 +340,99 @@
         return days < 60 ? `${Math.round(days)} Tage` : `${(days / 30.44).toFixed(1)} Monate`;
     }
 
-    const purges = computed(() => groupPurges(events.value.filter((e) => e.type === 'removed')));
+    const scanRemovals = computed(() => events.value.filter((e) => e.type === 'removed' && e.source !== 'departure'));
+    const purges = computed(() => groupPurges(scanRemovals.value));
+
+    /** Die Events hinter einer Gruppe - fuer Nachpruefung und Haken. */
+    function groupEvents(g) {
+        const ids = new Set(g.friendIds);
+        return scanRemovals.value.filter(
+            (e) => e.mutualId === g.mutualId && ids.has(e.friendId) && e.detectedAt >= g.from && e.detectedAt <= g.to
+        );
+    }
+
+    function groupVerified(g) {
+        const list = groupEvents(g);
+        return list.length > 0 && list.every((e) => e.verifiedAt);
+    }
+
+    /** Ex-Freunde: wer nach dem Ende bei ihnen raus ist und wer bleibt. */
+    const departureCards = computed(() => {
+        const removedBy = new Map();
+        for (const e of events.value) {
+            if (e.type !== 'removed' || e.source !== 'departure') continue;
+            if (!removedBy.has(e.friendId)) removedBy.set(e.friendId, new Set());
+            removedBy.get(e.friendId).add(e.mutualId);
+        }
+        const keptBy = new Map();
+        for (const e of edges.value) {
+            if (!e.active) continue;
+            if (!keptBy.has(e.friendId)) keptBy.set(e.friendId, []);
+            keptBy.get(e.friendId).push(e.mutualId);
+        }
+        return departures.value.map((d) => ({
+            ...d,
+            removedIds: [...(removedBy.get(d.userId) || [])],
+            keptIds: keptBy.get(d.userId) || []
+        }));
+    });
+
+    const visibleDepartures = computed(() =>
+        departureCards.value.filter(
+            (d) => shown(d.userId, ...d.removedIds) && matches(nameOf(d.userId), d.userId)
+        )
+    );
+
+    const verifyMsg = ref('');
+
+    async function runVerify(list) {
+        const ctx = getCtx();
+        if (scanState.running || !list.length) return;
+        scanState.running = true;
+        scanState.source = 'verify';
+        scanState.progress = { done: 0, total: 0, changes: 0, optedOut: 0 };
+        verifyMsg.value = 'prüfe…';
+        try {
+            const r = await verifyRemovals(ctx, list, {
+                onProgress: (p) => (verifyMsg.value = `prüfe… ${p.done}/${p.total}`)
+            });
+            verifyMsg.value =
+                `${r.confirmed} bestätigt, ${r.restored} waren falsch (entfernt)` +
+                (r.unknown ? `, ${r.unknown} nicht prüfbar` : '') +
+                (r.failed ? `, ${r.failed} Abfrage fehlgeschlagen` : '');
+        } catch (err) {
+            verifyMsg.value = 'Prüfung fehlgeschlagen';
+            ctx.error('Nachprüfung:', err);
+        } finally {
+            scanState.running = false;
+            scanState.source = null;
+            await refresh();
+        }
+    }
+
+    function verifyGroup(g) {
+        return runVerify(groupEvents(g));
+    }
+
+    function verifyAll() {
+        return runVerify(visiblePurges.value.flatMap((g) => groupEvents(g)));
+    }
+
+    async function recheckDeparture(userId) {
+        const ctx = getCtx();
+        if (scanState.running) return;
+        scanState.running = true;
+        scanState.source = 'verify';
+        try {
+            await checkDepartures(ctx, { only: [userId] });
+        } catch (err) {
+            ctx.error('Neu prüfen:', err);
+        } finally {
+            scanState.running = false;
+            scanState.source = null;
+            await refresh();
+        }
+    }
 
     const ctxCache = new Map();
     function contextFor(mutualId) {
@@ -384,6 +541,7 @@
             events.value = await loadEvents(ctx);
             edges.value = await loadEdges(ctx);
             runs.value = await loadRuns(ctx);
+            departures.value = await loadDepartures(ctx);
             settings.value = await loadSettings(ctx);
             pickerDraft.value = settings.value.visible === null ? null : new Set(settings.value.visible);
             ctxCache.clear();
@@ -625,5 +783,25 @@
         display: inline-flex;
         align-items: center;
         gap: 5px;
+    }
+    .mt-section-head {
+        display: flex;
+        align-items: baseline;
+        gap: 10px;
+        flex-wrap: wrap;
+        margin: 6px 0 10px;
+    }
+    .mt-h3 {
+        margin: 0;
+        font-size: 14px;
+        font-weight: 600;
+    }
+    .mt-btn--small {
+        padding: 2px 8px;
+        font-size: 11px;
+    }
+    .mt-btn:disabled {
+        opacity: 0.4;
+        cursor: default;
     }
 </style>
