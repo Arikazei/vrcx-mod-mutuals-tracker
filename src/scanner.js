@@ -1,6 +1,17 @@
-import { classifyChanges, isMassDrop } from './engine';
-import { applyChanges, edgesOf, finishRun, friendsAddedSince, lastRunStart, startRun } from './db';
+import { classifyChanges, isListHidden, isMassDrop } from './engine';
+import {
+    applyChanges,
+    clearHiddenList,
+    edgesOf,
+    finishRun,
+    friendsAddedSince,
+    lastRunStart,
+    loadHiddenLists,
+    setHiddenList,
+    startRun
+} from './db';
 import { checkDepartures } from './integrity';
+import { refreshUnseen } from './notify';
 import { fetchMutualIds } from './mutualsApi';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -30,6 +41,7 @@ export async function runScan(ctx, { onProgress, shouldStop, gapMs = 1500 } = {}
 
     const myFriends = new Set(friends);
     const newFriends = await friendsAddedSince(ctx, await lastRunStart(ctx));
+    const hiddenLists = new Set((await loadHiddenLists(ctx)).map((h) => h.userId));
 
     const runId = await startRun(ctx);
     let scanned = 0;
@@ -48,7 +60,7 @@ export async function runScan(ctx, { onProgress, shouldStop, gapMs = 1500 } = {}
                 optedOut++;
             } else if (res?.success) {
                 const current = (res.mutuals || []).map((m) => m?.id).filter(Boolean);
-                const r = await scanOne(ctx, friendId, current, { myFriends, newFriends, runId, gapMs });
+                const r = await scanOne(ctx, friendId, current, { myFriends, newFriends, runId, gapMs, hiddenLists });
                 changes += r.changes;
                 held += r.held;
                 rejected += r.rejected;
@@ -75,14 +87,29 @@ export async function runScan(ctx, { onProgress, shouldStop, gapMs = 1500 } = {}
         }
     }
 
+    await refreshUnseen(ctx);
     return { runId, scanned, optedOut, changes, held, rejected, departures };
 }
 
-async function scanOne(ctx, friendId, current, { myFriends, newFriends, runId, gapMs }) {
+async function scanOne(ctx, friendId, current, { myFriends, newFriends, runId, gapMs, hiddenLists }) {
     const edges = await edgesOf(ctx, friendId);
     const known = edges.filter((e) => e.active).map((e) => e.mutualId);
     const hidden = new Set(edges.filter((e) => e.hidden).map((e) => e.mutualId));
     const missCount = new Map(edges.map((e) => [e.mutualId, e.missCount]));
+
+    // Ploetzlich komplett leer: fast immer auf privat gestellt. Nichts als
+    // Entfernung werten, letzten Stand einfrieren und nur melden.
+    if (isListHidden(known.length, current.length)) {
+        if (!hiddenLists.has(friendId)) {
+            await setHiddenList(ctx, friendId, new Date().toISOString(), known.length);
+            hiddenLists.add(friendId);
+        }
+        return { changes: 0, held: 0, rejected: 0 };
+    }
+    if (current.length && hiddenLists.has(friendId)) {
+        await clearHiddenList(ctx, friendId);
+        hiddenLists.delete(friendId);
+    }
 
     const c = classifyChanges({
         known,

@@ -1,6 +1,6 @@
 {
     "name": "vrcx-mod-mutuals-tracker",
-    "version": "0.3.0",
+    "version": "0.4.0",
     "description": "Zeichnet auf, wer sich mit wem befreundet und entfreundet - inklusive Aufraeumaktionen",
     "type": "module",
     "scripts": {

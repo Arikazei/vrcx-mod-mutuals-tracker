@@ -3,6 +3,7 @@ import { initSettings } from './settings';
 import { startSchedule } from './schedule';
 import { scanState, setCtx } from './runtime';
 import { checkDepartures, cleanupFalseEvents } from './integrity';
+import { refreshUnseen, startNavDot } from './notify';
 import { MOD_VERSION } from './version';
 import MutualsView from './MutualsView.vue';
 
@@ -35,6 +36,9 @@ export default {
                 } catch (err) {
                     ctx.warn('Bereinigung fehlgeschlagen:', err);
                 }
+
+                startNavDot();
+                await refreshUnseen(ctx);
 
                 // Ex-Freunde nachsehen, sobald die Freundesliste da ist - wenige Anfragen
                 setTimeout(async () => {

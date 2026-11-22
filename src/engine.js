@@ -299,3 +299,106 @@ export function planVerification(pairs, myFriends) {
     }
     return { plan, unknown };
 }
+
+// ---------------------------------------------------------------------------
+// Leere Listen (ab 0.4.0)
+//
+// Liefert VRChat fuer jemanden ploetzlich GAR KEINE Mutuals mehr, hat die
+// Person fast immer ihre Verbindungen auf privat gestellt - nicht alle
+// Freunde geloescht. Unterscheiden laesst sich das von aussen nicht, darum
+// gibt es dafuer nur eine Meldung "privat oder Liste komplett leer" statt
+// einer Aufraeumaktion.
+// ---------------------------------------------------------------------------
+
+export const HIDDEN_LIST_MIN = 3;
+
+export function isListHidden(knownCount, currentCount, min = HIDDEN_LIST_MIN) {
+    return currentCount === 0 && knownCount >= min;
+}
+
+/**
+ * Altdaten: Laeufe, in denen ein Freund ALLE bekannten Mutuals auf einmal
+ * verloren hat.
+ *
+ * @param {Array<{id, friendId, mutualId, type, detectedAt, runId, source}>} events
+ * @param {Array<{friendId, mutualId, firstSeen}>} edges
+ * @returns {Array<{friendId, runId, detectedAt, removedIds: number[], mutualIds: string[], returnIds: number[]}>}
+ */
+export function findWholeListDrops(events, edges, min = HIDDEN_LIST_MIN) {
+    const scan = events
+        .filter((e) => (e.source || 'scan') === 'scan')
+        .sort((a, b) => (a.detectedAt < b.detectedAt ? -1 : a.detectedAt > b.detectedAt ? 1 : a.id - b.id));
+
+    const byFriend = new Map();
+    for (const e of scan) {
+        if (!byFriend.has(e.friendId)) byFriend.set(e.friendId, []);
+        byFriend.get(e.friendId).push(e);
+    }
+    const edgesByFriend = new Map();
+    for (const e of edges) {
+        if (!edgesByFriend.has(e.friendId)) edgesByFriend.set(e.friendId, []);
+        edgesByFriend.get(e.friendId).push(e);
+    }
+
+    const result = [];
+    for (const [friendId, list] of byFriend) {
+        const runs = new Map();
+        for (const e of list) {
+            if (e.type !== 'removed') continue;
+            if (!runs.has(e.runId)) runs.set(e.runId, []);
+            runs.get(e.runId).push(e);
+        }
+
+        for (const [runId, removed] of runs) {
+            if (removed.length < min) continue;
+            const at = removed[0].detectedAt;
+
+            // Wer war direkt vor diesem Lauf bekannt?
+            let known = 0;
+            for (const edge of edgesByFriend.get(friendId) || []) {
+                if (!edge.firstSeen || edge.firstSeen > at) continue;
+                // verdeckt = Person ist nicht mehr MEIN Freund; zaehlt fuer "ganze Liste" nicht
+                if (edge.hidden && !edge.active) continue;
+                const before = list.filter((e) => e.mutualId === edge.mutualId && e.runId !== runId && e.detectedAt < at);
+                const last = before[before.length - 1];
+                if (!last || last.type === 'added') known++;
+            }
+            if (removed.length < known) continue;
+
+            const ids = new Set(removed.map((e) => e.mutualId));
+            // Kam die Liste spaeter zurueck, sind die ersten "dazu" danach ebenfalls falsch
+            const returnIds = [];
+            const seen = new Set();
+            for (const e of list) {
+                if (e.detectedAt <= at || !ids.has(e.mutualId) || seen.has(e.mutualId)) continue;
+                seen.add(e.mutualId);
+                if (e.type === 'added') returnIds.push(e.id);
+            }
+
+            result.push({
+                friendId,
+                runId,
+                detectedAt: at,
+                removedIds: removed.map((e) => e.id),
+                mutualIds: [...ids],
+                returnIds
+            });
+        }
+    }
+    return result;
+}
+
+/**
+ * Juengster Zeitpunkt, zu dem in "Aufraeumaktionen" etwas Neues auftauchte.
+ * Grundlage fuer den roten Punkt.
+ */
+export function latestPurgeEntry({ departures = [], groups = [], hiddenLists = [] }) {
+    let latest = null;
+    const take = (iso) => {
+        if (iso && (!latest || iso > latest)) latest = iso;
+    };
+    for (const d of departures) if (d.status !== 'failed') take(d.checkedAt);
+    for (const g of groups) take(g.to);
+    for (const h of hiddenLists) take(h.since);
+    return latest;
+}

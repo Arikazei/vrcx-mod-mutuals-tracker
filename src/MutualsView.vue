@@ -1,5 +1,5 @@
 <template>
-    <div class="mt-root">
+    <div ref="rootEl" class="mt-root">
         <div class="mt-head">
             <h2 class="mt-title">{{ t('mods.mutualstracker.nav') }}</h2>
             <div class="mt-seg">
@@ -10,6 +10,7 @@
                     :class="{ 'mt-tab--active': view === tab.key }"
                     @click="view = tab.key">
                     {{ tab.label }}
+                    <span v-if="tab.key === 'purges' && notifyState.unseen" class="mt-dot" aria-hidden="true"></span>
                 </button>
             </div>
             <input v-model="search" class="mt-search" type="text" placeholder="Suche…" />
@@ -169,6 +170,13 @@
                 </div>
                 <div class="mt-card-body">
                     <div v-if="d.status === 'hidden'" class="mt-muted">Mutuals dieser Person sind nicht einsehbar.</div>
+                    <div v-else-if="d.status === 'empty'">
+                        <span class="mt-badge mt-badge--warn">privat oder Liste komplett leer</span>
+                        <span class="mt-muted">
+                            VRChat liefert keine Mutuals mehr (zuvor {{ d.known }}). Meist auf privat gestellt - daraus
+                            lässt sich keine Aufräumaktion ablesen.
+                        </span>
+                    </div>
                     <div v-else-if="d.status === 'failed'" class="mt-muted">
                         Abfrage fehlgeschlagen - wird beim nächsten Scan wiederholt.
                     </div>
@@ -194,6 +202,23 @@
                     </template>
                 </div>
             </div>
+
+            <template v-if="visibleHiddenLists.length">
+                <div class="mt-section-head">
+                    <h3 class="mt-h3">Mutuals nicht mehr sichtbar</h3>
+                    <span class="mt-muted">
+                        Diese Freunde zeigen plötzlich gar keine Mutuals mehr. Der letzte bekannte Stand bleibt erhalten,
+                        nichts davon wird als Entfernung gewertet.
+                    </span>
+                </div>
+                <div v-for="h in visibleHiddenLists" :key="h.userId" class="mt-card">
+                    <div class="mt-card-head">
+                        <a class="mt-link mt-strong" @click="openUser(h.userId)">{{ nameOf(h.userId) }}</a>
+                        <span class="mt-badge mt-badge--warn">privat oder Liste komplett leer</span>
+                        <span class="mt-muted">seit {{ formatDate(h.since) }} · zuvor {{ h.known }} Mutuals</span>
+                    </div>
+                </div>
+            </template>
 
             <div class="mt-section-head">
                 <h3 class="mt-h3">Bei mehreren deiner Freunde raus</h3>
@@ -239,10 +264,11 @@
 </template>
 
 <script setup>
-    import { computed, onActivated, onMounted, ref } from 'vue';
+    import { computed, onActivated, onMounted, onUnmounted, ref, watch } from 'vue';
+    import { markSeen, notifyState, refreshUnseen } from './notify';
 
     import { buildOwnTimeline, friendshipSpans, groupPurges, purgeContext } from './engine';
-    import { loadDepartures, loadEdges, loadEvents, loadOwnHistory, loadRuns } from './db';
+    import { loadDepartures, loadEdges, loadEvents, loadHiddenLists, loadOwnHistory, loadRuns } from './db';
     import { checkDepartures, verifyRemovals } from './integrity';
     import { DEFAULT_SETTINGS, loadSettings, saveSettings } from './settings';
     import { runScan } from './scanner';
@@ -264,6 +290,7 @@
     const edges = ref([]);
     const runs = ref([]);
     const departures = ref([]);
+    const hiddenLists = ref([]);
     const names = ref(new Map());
     const settings = ref(structuredClone(DEFAULT_SETTINGS));
     const showPicker = ref(false);
@@ -542,14 +569,44 @@
             edges.value = await loadEdges(ctx);
             runs.value = await loadRuns(ctx);
             departures.value = await loadDepartures(ctx);
+            hiddenLists.value = await loadHiddenLists(ctx);
             settings.value = await loadSettings(ctx);
             pickerDraft.value = settings.value.visible === null ? null : new Set(settings.value.visible);
             ctxCache.clear();
             buildNames();
+            await refreshUnseen(ctx);
+            await seenIfOpen();
         } catch (err) {
             ctx.error('Laden fehlgeschlagen:', err);
         }
     }
+
+    // ----------------------------------------------------------- roter Punkt
+    const rootEl = ref(null);
+
+    /** Gilt als gelesen, sobald der Reiter wirklich auf dem Schirm ist. */
+    async function seenIfOpen() {
+        if (view.value !== 'purges' || !notifyState.unseen) return;
+        if (!rootEl.value || rootEl.value.offsetParent === null) return;
+        try {
+            await markSeen(getCtx());
+        } catch (err) {
+            getCtx().warn('Gelesen-Markierung fehlgeschlagen:', err);
+        }
+    }
+
+    watch(view, seenIfOpen);
+    watch(() => notifyState.unseen, seenIfOpen);
+    // Rueckkehr zur Seite (VRCX blendet sie nur aus) bemerkt sonst niemand
+    const seenTimer = setInterval(seenIfOpen, 2000);
+    onUnmounted(() => clearInterval(seenTimer));
+
+    const visibleHiddenLists = computed(() => {
+        const dep = new Set(departures.value.map((d) => d.userId));
+        return hiddenLists.value.filter(
+            (h) => !dep.has(h.userId) && shown(h.userId) && matches(nameOf(h.userId), h.userId)
+        );
+    });
 
     async function startScan() {
         const ctx = getCtx();
@@ -783,6 +840,23 @@
         display: inline-flex;
         align-items: center;
         gap: 5px;
+    }
+    .mt-tab {
+        position: relative;
+    }
+    .mt-dot {
+        position: absolute;
+        top: 3px;
+        right: 3px;
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: #ef4444;
+    }
+    .mt-badge--warn {
+        border-color: #f5a62388;
+        color: #f5a623;
+        margin-right: 6px;
     }
     .mt-section-head {
         display: flex;

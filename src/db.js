@@ -70,6 +70,51 @@ export async function initTables(ctx) {
         )`
     );
     await ctx.db.exec(`CREATE TABLE IF NOT EXISTS ${META(ctx)} (key TEXT PRIMARY KEY, value TEXT)`);
+    // 0.4.0: Freunde, deren Mutual-Liste ploetzlich komplett leer ist (meist privat gestellt)
+    await ctx.db.exec(
+        `CREATE TABLE IF NOT EXISTS ${HIDDEN_LISTS(ctx)} (
+            user_id TEXT PRIMARY KEY,
+            since TEXT,
+            known INTEGER DEFAULT 0
+        )`
+    );
+}
+
+const HIDDEN_LISTS = (ctx) => `${ctx.db.prefix()}_hidden_lists`;
+
+export async function setHiddenList(ctx, userId, since, known) {
+    await ctx.db.exec(
+        `INSERT INTO ${HIDDEN_LISTS(ctx)} (user_id, since, known) VALUES (@u, @s, @k)
+         ON CONFLICT(user_id) DO UPDATE SET since = MAX(since, @s), known = MAX(known, @k)`,
+        { '@u': userId, '@s': since, '@k': known }
+    );
+}
+
+export async function clearHiddenList(ctx, userId) {
+    await ctx.db.exec(`DELETE FROM ${HIDDEN_LISTS(ctx)} WHERE user_id = @u`, { '@u': userId });
+}
+
+export async function loadHiddenLists(ctx) {
+    const rows = await ctx.db.query(`SELECT user_id, since, known FROM ${HIDDEN_LISTS(ctx)} ORDER BY since DESC`);
+    return rows.map((r) => ({ userId: r[0], since: r[1], known: r[2] }));
+}
+
+/** Kanten wieder als "zuletzt bekannt" aktiv setzen (eingefrorene Liste). */
+export async function reactivateEdges(ctx, friendId, mutualIds, myFriends) {
+    for (const m of mutualIds) {
+        const visible = myFriends.has(m);
+        await ctx.db.exec(
+            `UPDATE ${EDGES(ctx)} SET active = @a, hidden = @h, miss_count = 0 WHERE friend_id = @f AND mutual_id = @m`,
+            { '@a': visible ? 1 : 0, '@h': visible ? 0 : 1, '@f': friendId, '@m': m }
+        );
+    }
+}
+
+export async function countActive(ctx, friendId) {
+    const rows = await ctx.db.query(`SELECT COUNT(*) FROM ${EDGES(ctx)} WHERE friend_id = @f AND active = 1`, {
+        '@f': friendId
+    });
+    return rows[0]?.[0] ?? 0;
 }
 
 const DEPARTURES = (ctx) => `${ctx.db.prefix()}_departures`;
@@ -233,8 +278,8 @@ export async function loadEvents(ctx, type = null, limit = 5000) {
 }
 
 export async function loadEdges(ctx) {
-    const rows = await ctx.db.query(`SELECT friend_id, mutual_id, active, hidden FROM ${EDGES(ctx)}`);
-    return rows.map((r) => ({ friendId: r[0], mutualId: r[1], active: r[2], hidden: r[3] }));
+    const rows = await ctx.db.query(`SELECT friend_id, mutual_id, active, hidden, first_seen FROM ${EDGES(ctx)}`);
+    return rows.map((r) => ({ friendId: r[0], mutualId: r[1], active: r[2], hidden: r[3], firstSeen: r[4] }));
 }
 
 /** Start des letzten abgeschlossenen Laufs (inkl. Ausgangszustand). */
