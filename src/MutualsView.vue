@@ -173,8 +173,8 @@
                     <div v-else-if="d.status === 'empty'">
                         <span class="mt-badge mt-badge--warn">privat oder Liste komplett leer</span>
                         <span class="mt-muted">
-                            VRChat liefert keine Mutuals mehr (zuvor {{ d.known }}). Meist auf privat gestellt - daraus
-                            lässt sich keine Aufräumaktion ablesen.
+                            VRChat liefert keine Mutuals mehr (zuvor {{ d.known }}). Da die Person dich entfernt hat,
+                            lässt sich nicht unterscheiden, ob sie alle gelöscht oder die Liste auf privat gestellt hat.
                         </span>
                     </div>
                     <div v-else-if="d.status === 'failed'" class="mt-muted">
@@ -205,16 +205,17 @@
 
             <template v-if="visibleHiddenLists.length">
                 <div class="mt-section-head">
-                    <h3 class="mt-h3">Mutuals nicht mehr sichtbar</h3>
+                    <h3 class="mt-h3">Mutuals auf privat gestellt</h3>
                     <span class="mt-muted">
-                        Diese Freunde zeigen plötzlich gar keine Mutuals mehr. Der letzte bekannte Stand bleibt erhalten,
-                        nichts davon wird als Entfernung gewertet.
+                        Diese Freunde zeigen plötzlich gar keine Mutuals mehr. Da du noch mit ihnen befreundet bist,
+                        haben sie nicht aufgeräumt, sondern ihre Liste auf privat gestellt. Der letzte bekannte Stand
+                        bleibt erhalten.
                     </span>
                 </div>
                 <div v-for="h in visibleHiddenLists" :key="h.userId" class="mt-card">
                     <div class="mt-card-head">
                         <a class="mt-link mt-strong" @click="openUser(h.userId)">{{ nameOf(h.userId) }}</a>
-                        <span class="mt-badge mt-badge--warn">privat oder Liste komplett leer</span>
+                        <span class="mt-badge mt-badge--warn">Liste privat</span>
                         <span class="mt-muted">seit {{ formatDate(h.since) }} · zuvor {{ h.known }} Mutuals</span>
                     </div>
                 </div>
@@ -603,8 +604,11 @@
 
     const visibleHiddenLists = computed(() => {
         const dep = new Set(departures.value.map((d) => d.userId));
+        // "privat" gilt nur, solange ich noch befreundet bin - sonst ist es eine beendete Freundschaft
+        const friends = getCtx().stores.friends?.friends;
+        const stillFriend = (id) => !friends?.size || friends.has(id);
         return hiddenLists.value.filter(
-            (h) => !dep.has(h.userId) && shown(h.userId) && matches(nameOf(h.userId), h.userId)
+            (h) => !dep.has(h.userId) && stillFriend(h.userId) && shown(h.userId) && matches(nameOf(h.userId), h.userId)
         );
     });
 
